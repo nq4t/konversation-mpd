@@ -1,8 +1,19 @@
 #!/bin/bash
+# mpd announcer for Konversation - dewdude/Jay - dewdude@pickmy.org
+# requires mpd and bc
+#
+# makes direct connection to mpd, polls for information
+# spams it as an action to the current channel
+# does some sample rate converstion - detects SACD playback
 
+# Kompozer's always passed arguements
 SERVER=$1
 TARGET=$2
+shift
+shift
+[[ -n "$@" ]] && COMMAND="$@"
 
+# Initialize dbus
 _qdbus=${KONVERSATION_DBUS_BIN:-qdbus-qt6}
 if ! [ "$(which $_qdbus 2> /dev/null)" ]; then
     _qdbus=qdbus
@@ -12,6 +23,10 @@ if ! [ "$(which $_qdbus 2> /dev/null)" ]; then
     fi
 fi
 
+# Script Functions
+
+# Converts decimal seconds to "normal" format
+# Arguments: seconds (floating point)
 seconds_to_mmss() {
     local total_seconds="$1"
 
@@ -26,6 +41,8 @@ seconds_to_mmss() {
     printf "%02d:%02d" "$minutes" "$seconds"
 }
 
+# Reparses the audio format tag, converts it to khz, and does stuff for DSD/SACD
+# Argument: number:number:number (44100:16:2 - usually $audio)
 format_audio() {
     local audio_format="$1"
 
@@ -34,6 +51,7 @@ format_audio() {
 
     # Fix it all to stereo!
     local channel_text="Stereo"
+    # DSD is silly, but I still <3 it.
     case $samplerate in
         dsd64)
             local samplerate="2.822MHz"
@@ -56,9 +74,10 @@ format_audio() {
             dsd="DSD512"
             ;;
         *)
+            # Converts from Hz to kHz
             local trate="$(echo "scale=1; $samplerate / 1000" | bc)"
+            # Drops the trailing zero on sample rates like 192khz
             samplerate="${trate%.0}kHz"
-            dsd=""
             ;;
     esac
 
@@ -79,7 +98,9 @@ get_extension() {
 }
 
 get_mpd_data() {
-    # Send commands
+# This calls status and currentsong from mpd. writes result as a variable with it's value
+# performs some sanitization. TODO: Get you a list of what's used.
+    # Send commands to mpd
     printf "command_list_begin\r\nstatus\r\ncurrentsong\r\ncommand_list_end\r\n" >&3
 
     # Read responses until we get empty line or OK
@@ -87,29 +108,66 @@ get_mpd_data() {
         [[ "$name" == "" ]] && break  # Empty line = end of response
         [[ "$name" == "OK" ]] && break
 
-        # Process the data
+        # Read each response and convert it in to variable=value
         if [[ -n "$name" && -n "$value" && "$name" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]]; then
-            declare -g "$name=$value"  # Use -g for global scope
+            declare -g "$name=$value"  # Use -g for global scope - which works here.
         fi
     done
 }
 
+sendtokonversation() {
+# Send output to channel and leave
+$_qdbus org.kde.konversation /irc say $SERVER "$TARGET" "$spam"
 
-# Open non-blocking connection MPD
+exec 3<&-
+exit
+}
+
+# We need (or I needed) non-blocking raw TCP. I don't think MPD has a command to close the client connection. I can send Quit or QUIT; and
+# it works, but only ineractively. Any attempts to automatically script the commands to nc fail. It's like it doesn't care it saw 5 commands
+# before quit...sent in order...or even in command list; you'll get the OK MPD banner and nothing. But this trick right here doesn't care.
+# It's just raw TCP directly in shell. All I have to do is remember to read from it.
 exec 3<>/dev/tcp/localhost/6600
 
 # Clears the connection string from the buffer
 read -r greeting <&3
 
-# Request Data
+# Control MPD
+# If we're just sending a command, we can just do it here without polling for data.
+#
+if [[ -n "$COMMAND" ]]; then
+    printf "$COMMAND\r\n" >&3
+    read -r response <&3
+    if [[ $response != "OK" ]]; then
+    $_qdbus org.kde.konversation /irc error "mpd: $response"
+    fi
+    exec 3<&-
+    exit
+fi
+
+# It's all a giant work around for the fact format_audio can't set globals!
+#
+# Get the data from MPD
 get_mpd_data
-# This is part of the global varible hack junk.
+case $state in
+    stop)
+        spam="/me mpd: Not Playing"
+        sendtokonversation
+        ;;
+    pause)
+        Artist="[Paused] $Artist"
+        ;;
+    *)
+        ;;
+    esac
+
+# Send $audio to format_audio so it can do it's magic. Also is here now due to variable hack.
 audio_result=$(format_audio $audio)
-# It splits the result in to new variables
+# Splits audio_result since we couldn't directly set variables from the function. For some reason. I hate bash.
 format_part="${audio_result%|*}"    # Everything before the |
 dsd_part="${audio_result#*|}"       # Everything after the |
 
-# Generate codec - either extension, DSD??, or DSD64/Super Audio CD.
+# Literally determines if it should display DSD, the extension, or DSD/SuperAudioCD
 fileext=$(get_extension "$file")
 if [[ -z "$dsd_part" ]]; then
     codec_result="$fileext"
@@ -120,10 +178,6 @@ else
 fi
 
 
-# Format output to send to konversation
 spam="/me mpd: $Artist - $Title (From: $Album) [$(seconds_to_mmss $elapsed)/$(seconds_to_mmss $duration) | $format_part | $bitrate kbps | $codec_result]"
 
-# Spam that IRC channel!
-$_qdbus org.kde.konversation /irc say $SERVER "$TARGET" "$spam"
-
-exec 3<&-
+sendtokonversation
