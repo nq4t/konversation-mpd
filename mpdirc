@@ -1,0 +1,129 @@
+#!/bin/bash
+
+SERVER=$1
+TARGET=$2
+
+_qdbus=${KONVERSATION_DBUS_BIN:-qdbus-qt6}
+if ! [ "$(which $_qdbus 2> /dev/null)" ]; then
+    _qdbus=qdbus
+    if ! [ "$(which $_qdbus 2> /dev/null)" ]; then
+        echo "Error: The qdbus (or qdbus-qt6) utility is missing."
+        exit 1
+    fi
+fi
+
+seconds_to_mmss() {
+    local total_seconds="$1"
+
+    # Convert to integer (truncate decimal part)
+    local int_seconds=$(printf "%.0f" "$total_seconds")
+
+    # Calculate minutes and seconds
+    local minutes=$((int_seconds / 60))
+    local seconds=$((int_seconds % 60))
+
+    # Format with leading zeros
+    printf "%02d:%02d" "$minutes" "$seconds"
+}
+
+format_audio() {
+    local audio_format="$1"
+
+    # Split the format string on colons
+    IFS=':' read -r samplerate bitdepth channels <<< "$audio_format"
+
+    # Fix it all to stereo!
+    local channel_text="Stereo"
+    case $samplerate in
+        dsd64)
+            local samplerate="2.822MHz"
+            local bitdepth="1"
+            dsd="DSD64"
+            ;;
+        dsd128)
+            local samplerate="5.644MHz"
+            local bitdepth="1"
+            dsd="DSD128"
+            ;;
+        dsd256)
+            local samplerate="11.288MHz"
+            local bitdepth="1"
+            dsd="DSD256"
+            ;;
+        dsd512)
+            local samplerate="22.576MHz"
+            local bitdepth="1"
+            dsd="DSD512"
+            ;;
+        *)
+            local trate="$(echo "scale=1; $samplerate / 1000" | bc)"
+            samplerate="${trate%.0}kHz"
+            dsd=""
+            ;;
+    esac
+
+    # Return formatted string - we can't set global variables here so we have to split it out later. Thanks bash!
+        echo "${samplerate}/${bitdepth}-bit/${channel_text}|${dsd}"
+}
+
+
+get_extension() {
+    local filepath="$1"
+
+    # Get just the filename without the path
+    local filename="${filepath##*/}"
+
+    # Extract extension and convert to uppercase
+    local extension="${filename##*.}"
+    echo "${extension^^}"
+}
+
+get_mpd_data() {
+    # Send commands
+    printf "command_list_begin\r\nstatus\r\ncurrentsong\r\ncommand_list_end\r\n" >&3
+
+    # Read responses until we get empty line or OK
+    while IFS=': ' read -r name value <&3; do
+        [[ "$name" == "" ]] && break  # Empty line = end of response
+        [[ "$name" == "OK" ]] && break
+
+        # Process the data
+        if [[ -n "$name" && -n "$value" && "$name" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]]; then
+            declare -g "$name=$value"  # Use -g for global scope
+        fi
+    done
+}
+
+
+# Open non-blocking connection MPD
+exec 3<>/dev/tcp/localhost/6600
+
+# Clears the connection string from the buffer
+read -r greeting <&3
+
+# Request Data
+get_mpd_data
+# This is part of the global varible hack junk.
+audio_result=$(format_audio $audio)
+# It splits the result in to new variables
+format_part="${audio_result%|*}"    # Everything before the |
+dsd_part="${audio_result#*|}"       # Everything after the |
+
+# Generate codec - either extension, DSD??, or DSD64/Super Audio CD.
+fileext=$(get_extension "$file")
+if [[ -z "$dsd_part" ]]; then
+    codec_result="$fileext"
+elif [[ -n "dsd_part" && "$fileext" == "ISO" ]]; then
+    codec_result="$dsd_part/Super Audio CD"
+else
+    codec_result="$dsd_part"
+fi
+
+
+# Format output to send to konversation
+spam="/me mpd: $Artist - $Title (From: $Album) [$(seconds_to_mmss $elapsed)/$(seconds_to_mmss $duration) | $format_part | $bitrate kbps | $codec_result]"
+
+# Spam that IRC channel!
+$_qdbus org.kde.konversation /irc say $SERVER "$TARGET" "$spam"
+
+exec 3<&-
